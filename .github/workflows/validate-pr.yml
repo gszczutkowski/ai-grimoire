@@ -1,0 +1,339 @@
+name: Validate PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate artifact change
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed artifacts
+        id: detect
+        run: |
+          # -------------------------------------------------------------------
+          # 1. Find all artifact definition files changed in this PR
+          #    Artifact types: skills, commands, agents, hooks
+          # -------------------------------------------------------------------
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          # Collect changed artifact directories/files
+          ARTIFACTS=()
+
+          while IFS= read -r file; do
+            case "$file" in
+              skills/*/SKILL.md)
+                # e.g. skills/code-review/SKILL.md → skills/code-review
+                artifact_dir=$(dirname "$file")
+                artifact_name=${artifact_dir#skills/}
+                ARTIFACTS+=("skills/${artifact_name}")
+                ;;
+              skills/*/*)
+                # Supporting files in a skill directory (scripts, templates, etc.)
+                # Extract the skill name (first path component after skills/)
+                rest=${file#skills/}
+                # Handle nested skills like child/foo — the SKILL.md defines the boundary
+                # Walk up to find the SKILL.md
+                dir=$(dirname "$file")
+                while [[ "$dir" != "skills" && "$dir" != "." ]]; do
+                  if [[ -f "${dir}/SKILL.md" ]]; then
+                    artifact_name=${dir#skills/}
+                    ARTIFACTS+=("skills/${artifact_name}")
+                    break
+                  fi
+                  dir=$(dirname "$dir")
+                done
+                ;;
+              commands/*.md)
+                # e.g. commands/deploy-skills.md → commands/deploy-skills
+                # e.g. commands/child/generate-handwriting-practice.md → commands/child/generate-handwriting-practice
+                artifact_name=${file#commands/}
+                artifact_name=${artifact_name%.md}
+                ARTIFACTS+=("commands/${artifact_name}")
+                ;;
+              commands/*/*)
+                # Supporting files in a command directory
+                rest=${file#commands/}
+                # Find the .md file that defines this command
+                dir=$(dirname "$file")
+                cmd_name=${dir#commands/}
+                ARTIFACTS+=("commands/${cmd_name}")
+                ;;
+              agents/*.md)
+                artifact_name=${file#agents/}
+                artifact_name=${artifact_name%.md}
+                ARTIFACTS+=("agents/${artifact_name}")
+                ;;
+              agents/*/*)
+                dir=$(dirname "$file")
+                agent_name=${dir#agents/}
+                ARTIFACTS+=("agents/${agent_name}")
+                ;;
+              hooks/*.md|hooks/*.sh)
+                artifact_name=${file#hooks/}
+                artifact_name=${artifact_name%.*}
+                ARTIFACTS+=("hooks/${artifact_name}")
+                ;;
+              hooks/*/*)
+                dir=$(dirname "$file")
+                hook_name=${dir#hooks/}
+                ARTIFACTS+=("hooks/${hook_name}")
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          # De-duplicate
+          UNIQUE_ARTIFACTS=($(printf '%s\n' "${ARTIFACTS[@]}" | sort -u))
+          COUNT=${#UNIQUE_ARTIFACTS[@]}
+
+          echo "Changed artifacts ($COUNT):"
+          printf '  - %s\n' "${UNIQUE_ARTIFACTS[@]}"
+
+          if [[ $COUNT -eq 0 ]]; then
+            echo "artifact_count=0" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### No artifact changes detected — skipping version checks" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ $COUNT -gt 1 ]]; then
+            echo "::error::PR touches $COUNT artifacts. Only one artifact may be changed per PR."
+            echo "Artifacts found:"
+            printf '  - %s\n' "${UNIQUE_ARTIFACTS[@]}"
+            echo ""
+            echo "### :x: PR touches multiple artifacts" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Only **one** artifact may be changed per PR. Found:" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '- \`%s\`\n' "${UNIQUE_ARTIFACTS[@]}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          ARTIFACT="${UNIQUE_ARTIFACTS[0]}"
+          ARTIFACT_TYPE="${ARTIFACT%%/*}"
+          ARTIFACT_NAME="${ARTIFACT#*/}"
+
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "artifact_type=$ARTIFACT_TYPE" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "artifact_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version bump
+        if: steps.detect.outputs.skip != 'true'
+        env:
+          ARTIFACT: ${{ steps.detect.outputs.artifact }}
+          ARTIFACT_TYPE: ${{ steps.detect.outputs.artifact_type }}
+          ARTIFACT_NAME: ${{ steps.detect.outputs.artifact_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # -------------------------------------------------------------------
+          # 1. Locate the definition file and extract the version
+          # -------------------------------------------------------------------
+          if [[ "$ARTIFACT_TYPE" == "skills" ]]; then
+            DEF_FILE="skills/${ARTIFACT_NAME}/SKILL.md"
+          elif [[ "$ARTIFACT_TYPE" == "commands" ]]; then
+            DEF_FILE="commands/${ARTIFACT_NAME}.md"
+            # Fallback: command might be a directory-based command
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="commands/${ARTIFACT_NAME}/${ARTIFACT_NAME##*/}.md"
+            fi
+          elif [[ "$ARTIFACT_TYPE" == "agents" ]]; then
+            DEF_FILE="agents/${ARTIFACT_NAME}.md"
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="agents/${ARTIFACT_NAME}/${ARTIFACT_NAME##*/}.md"
+            fi
+          elif [[ "$ARTIFACT_TYPE" == "hooks" ]]; then
+            # Hooks may be .md or .sh — try both
+            DEF_FILE="hooks/${ARTIFACT_NAME}.md"
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="hooks/${ARTIFACT_NAME}.sh"
+            fi
+          fi
+
+          if [[ ! -f "$DEF_FILE" ]]; then
+            echo "::error::Definition file not found for $ARTIFACT (tried $DEF_FILE)"
+            exit 1
+          fi
+
+          echo "Definition file: $DEF_FILE"
+
+          # -------------------------------------------------------------------
+          # 2. Extract version from frontmatter
+          #    Skills use metadata.version, others use top-level version
+          # -------------------------------------------------------------------
+          FRONTMATTER=$(sed -n '/^---$/,/^---$/p' "$DEF_FILE" | sed '1d;$d')
+
+          if [[ "$ARTIFACT_TYPE" == "skills" ]]; then
+            NEW_VERSION=$(echo "$FRONTMATTER" | grep -A1 'metadata:' | grep 'version:' | sed 's/.*version:[[:space:]]*//' | tr -d '[:space:]')
+          else
+            NEW_VERSION=$(echo "$FRONTMATTER" | grep '^version:' | sed 's/version:[[:space:]]*//' | tr -d '[:space:]')
+          fi
+
+          if [[ -z "$NEW_VERSION" ]]; then
+            echo "::error::No version found in frontmatter of $DEF_FILE"
+            exit 1
+          fi
+
+          echo "New version: $NEW_VERSION"
+
+          # -------------------------------------------------------------------
+          # 3. Validate version format (semver)
+          # -------------------------------------------------------------------
+          if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $NEW_VERSION (expected MAJOR.MINOR.PATCH[-PRERELEASE])"
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # 4. Check if this is a SNAPSHOT version
+          # -------------------------------------------------------------------
+          if [[ "$NEW_VERSION" == *"-SNAPSHOT"* ]]; then
+            echo "::warning::Version $NEW_VERSION is a SNAPSHOT — it will NOT be tagged on merge"
+            echo "snapshot=true" >> "$GITHUB_OUTPUT"
+            echo "### :warning: SNAPSHOT version detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$ARTIFACT\` version \`$NEW_VERSION\` is a SNAPSHOT. No tag will be created on merge." >> "$GITHUB_STEP_SUMMARY"
+            # SNAPSHOTs are allowed — they just won't be tagged
+            exit 0
+          fi
+
+          # -------------------------------------------------------------------
+          # 5. Get the previous version from the base branch
+          # -------------------------------------------------------------------
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          OLD_VERSION=""
+
+          if git show "${BASE_REF}:${DEF_FILE}" &>/dev/null; then
+            OLD_FRONTMATTER=$(git show "${BASE_REF}:${DEF_FILE}" | sed -n '/^---$/,/^---$/p' | sed '1d;$d')
+
+            if [[ "$ARTIFACT_TYPE" == "skills" ]]; then
+              OLD_VERSION=$(echo "$OLD_FRONTMATTER" | grep -A1 'metadata:' | grep 'version:' | sed 's/.*version:[[:space:]]*//' | tr -d '[:space:]')
+            else
+              OLD_VERSION=$(echo "$OLD_FRONTMATTER" | grep '^version:' | sed 's/version:[[:space:]]*//' | tr -d '[:space:]')
+            fi
+          fi
+
+          if [[ -z "$OLD_VERSION" ]]; then
+            echo "New artifact — no previous version found"
+            echo "### :white_check_mark: New artifact" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$ARTIFACT\` is new. Tag \`${ARTIFACT_TYPE}/${ARTIFACT_NAME}@${NEW_VERSION}\` will be created on merge." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Previous version: $OLD_VERSION"
+
+          # -------------------------------------------------------------------
+          # 6. Verify version was actually bumped
+          # -------------------------------------------------------------------
+          if [[ "$NEW_VERSION" == "$OLD_VERSION" ]]; then
+            echo "::error::Version was not bumped. $DEF_FILE still has version $OLD_VERSION. Please bump the version."
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # 7. Determine expected bump type from PR title (Conventional Commits)
+          # -------------------------------------------------------------------
+          EXPECTED_BUMP="patch"
+
+          if [[ "$PR_TITLE" =~ ^[a-zA-Z]+(\([a-zA-Z0-9_/-]+\))?\!:[[:space:]]* ]]; then
+            EXPECTED_BUMP="major"
+          elif echo "$PR_BODY" | grep -qE '^BREAKING CHANGE:[[:space:]]'; then
+            EXPECTED_BUMP="major"
+          elif [[ "$PR_TITLE" =~ ^feat(\([a-zA-Z0-9_/-]+\))?:[[:space:]]* ]]; then
+            EXPECTED_BUMP="minor"
+          fi
+
+          # -------------------------------------------------------------------
+          # 8. Parse old and new version components
+          # -------------------------------------------------------------------
+          OLD_MAJOR=${OLD_VERSION%%.*}
+          OLD_MINOR_PATCH=${OLD_VERSION#*.}
+          OLD_MINOR=${OLD_MINOR_PATCH%.*}
+          OLD_PATCH_FULL=${OLD_VERSION##*.}
+          OLD_PATCH=${OLD_PATCH_FULL%%-*}
+
+          NEW_MAJOR=${NEW_VERSION%%.*}
+          NEW_MINOR_PATCH=${NEW_VERSION#*.}
+          NEW_MINOR=${NEW_MINOR_PATCH%.*}
+          NEW_PATCH_FULL=${NEW_VERSION##*.}
+          NEW_PATCH=${NEW_PATCH_FULL%%-*}
+
+          # Determine actual bump type
+          ACTUAL_BUMP=""
+          if [[ $NEW_MAJOR -gt $OLD_MAJOR ]]; then
+            ACTUAL_BUMP="major"
+          elif [[ $NEW_MAJOR -eq $OLD_MAJOR && $NEW_MINOR -gt $OLD_MINOR ]]; then
+            ACTUAL_BUMP="minor"
+          elif [[ $NEW_MAJOR -eq $OLD_MAJOR && $NEW_MINOR -eq $OLD_MINOR && $NEW_PATCH -gt $OLD_PATCH ]]; then
+            ACTUAL_BUMP="patch"
+          fi
+
+          if [[ -z "$ACTUAL_BUMP" ]]; then
+            echo "::error::Version went from $OLD_VERSION to $NEW_VERSION — this is not a valid bump (version must increase)"
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # 9. Validate bump matches conventional commit type
+          # -------------------------------------------------------------------
+          BUMP_ORDER="patch minor major"
+          EXPECTED_RANK=$(echo "$BUMP_ORDER" | tr ' ' '\n' | grep -n "^${EXPECTED_BUMP}$" | cut -d: -f1)
+          ACTUAL_RANK=$(echo "$BUMP_ORDER" | tr ' ' '\n' | grep -n "^${ACTUAL_BUMP}$" | cut -d: -f1)
+
+          if [[ $ACTUAL_RANK -lt $EXPECTED_RANK ]]; then
+            echo "::error::PR title indicates a $EXPECTED_BUMP bump, but version only increased by $ACTUAL_BUMP ($OLD_VERSION → $NEW_VERSION)"
+            exit 1
+          fi
+
+          # Check tag doesn't already exist
+          TAG="${ARTIFACT_TYPE}/${ARTIFACT_NAME}@${NEW_VERSION}"
+          if git rev-parse "refs/tags/${TAG}" &>/dev/null; then
+            echo "::error::Tag ${TAG} already exists"
+            exit 1
+          fi
+
+          echo "### :white_check_mark: Version bump validated" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact** | \`$ARTIFACT\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Previous version** | \`$OLD_VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **New version** | \`$NEW_VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump type** | $ACTUAL_BUMP (PR title suggests: $EXPECTED_BUMP) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Tag on merge** | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate PR title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # -------------------------------------------------------------------
+          # Require Conventional Commits format in PR title
+          #   type(optional-scope): description
+          # -------------------------------------------------------------------
+          if [[ ! "$PR_TITLE" =~ ^[a-z]+(\([a-zA-Z0-9_/-]+\))?\!?:[[:space:]].+ ]]; then
+            echo "::error::PR title must follow Conventional Commits format: type(scope): description"
+            echo "  Examples: feat: add X, fix: resolve Y, feat!: breaking change"
+            echo ""
+            echo "  Valid types: feat, fix, chore, docs, refactor, test, style, perf, ci, build"
+            echo ""
+            echo "### :x: Invalid PR title" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "PR title must follow [Conventional Commits](https://www.conventionalcommits.org/) format:" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "type(scope): description" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

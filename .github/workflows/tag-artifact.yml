@@ -1,0 +1,216 @@
+name: Tag Artifact
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  tag-artifact:
+    name: Create artifact version tag
+    # Only run when a PR is actually merged (not just closed)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags needed to verify tag uniqueness
+          fetch-depth: 0
+          # PAT is required so the created tag triggers downstream workflows
+          # (tags pushed via the default GITHUB_TOKEN do NOT trigger workflows)
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Detect merged artifact
+        id: detect
+        run: |
+          # -------------------------------------------------------------------
+          # Find which artifact was changed in the merged PR
+          # -------------------------------------------------------------------
+          MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+
+          # Get files changed in this PR
+          CHANGED_FILES=$(git diff --name-only "${MERGE_SHA}^" "$MERGE_SHA")
+
+          ARTIFACTS=()
+
+          while IFS= read -r file; do
+            case "$file" in
+              skills/*/SKILL.md)
+                artifact_dir=$(dirname "$file")
+                artifact_name=${artifact_dir#skills/}
+                ARTIFACTS+=("skills/${artifact_name}")
+                ;;
+              skills/*/*)
+                dir=$(dirname "$file")
+                while [[ "$dir" != "skills" && "$dir" != "." ]]; do
+                  if [[ -f "${dir}/SKILL.md" ]]; then
+                    artifact_name=${dir#skills/}
+                    ARTIFACTS+=("skills/${artifact_name}")
+                    break
+                  fi
+                  dir=$(dirname "$dir")
+                done
+                ;;
+              commands/*.md)
+                artifact_name=${file#commands/}
+                artifact_name=${artifact_name%.md}
+                ARTIFACTS+=("commands/${artifact_name}")
+                ;;
+              commands/*/*)
+                dir=$(dirname "$file")
+                cmd_name=${dir#commands/}
+                ARTIFACTS+=("commands/${cmd_name}")
+                ;;
+              agents/*.md)
+                artifact_name=${file#agents/}
+                artifact_name=${artifact_name%.md}
+                ARTIFACTS+=("agents/${artifact_name}")
+                ;;
+              agents/*/*)
+                dir=$(dirname "$file")
+                agent_name=${dir#agents/}
+                ARTIFACTS+=("agents/${agent_name}")
+                ;;
+              hooks/*.md|hooks/*.sh)
+                artifact_name=${file#hooks/}
+                artifact_name=${artifact_name%.*}
+                ARTIFACTS+=("hooks/${artifact_name}")
+                ;;
+              hooks/*/*)
+                dir=$(dirname "$file")
+                hook_name=${dir#hooks/}
+                ARTIFACTS+=("hooks/${hook_name}")
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          # De-duplicate
+          UNIQUE_ARTIFACTS=($(printf '%s\n' "${ARTIFACTS[@]}" | sort -u))
+          COUNT=${#UNIQUE_ARTIFACTS[@]}
+
+          if [[ $COUNT -eq 0 ]]; then
+            echo "No artifact changes — skipping tag creation"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ $COUNT -gt 1 ]]; then
+            echo "::warning::Multiple artifacts changed ($COUNT) — this should have been caught by PR validation. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARTIFACT="${UNIQUE_ARTIFACTS[0]}"
+          ARTIFACT_TYPE="${ARTIFACT%%/*}"
+          ARTIFACT_NAME="${ARTIFACT#*/}"
+
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "artifact_type=$ARTIFACT_TYPE" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version and create tag
+        if: steps.detect.outputs.skip != 'true'
+        env:
+          ARTIFACT: ${{ steps.detect.outputs.artifact }}
+          ARTIFACT_TYPE: ${{ steps.detect.outputs.artifact_type }}
+          ARTIFACT_NAME: ${{ steps.detect.outputs.artifact_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # -------------------------------------------------------------------
+          # 1. Locate definition file and extract version
+          # -------------------------------------------------------------------
+          if [[ "$ARTIFACT_TYPE" == "skills" ]]; then
+            DEF_FILE="skills/${ARTIFACT_NAME}/SKILL.md"
+          elif [[ "$ARTIFACT_TYPE" == "commands" ]]; then
+            DEF_FILE="commands/${ARTIFACT_NAME}.md"
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="commands/${ARTIFACT_NAME}/${ARTIFACT_NAME##*/}.md"
+            fi
+          elif [[ "$ARTIFACT_TYPE" == "agents" ]]; then
+            DEF_FILE="agents/${ARTIFACT_NAME}.md"
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="agents/${ARTIFACT_NAME}/${ARTIFACT_NAME##*/}.md"
+            fi
+          elif [[ "$ARTIFACT_TYPE" == "hooks" ]]; then
+            DEF_FILE="hooks/${ARTIFACT_NAME}.md"
+            if [[ ! -f "$DEF_FILE" ]]; then
+              DEF_FILE="hooks/${ARTIFACT_NAME}.sh"
+            fi
+          fi
+
+          if [[ ! -f "$DEF_FILE" ]]; then
+            echo "::error::Definition file not found: $DEF_FILE"
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # 2. Extract version from frontmatter
+          # -------------------------------------------------------------------
+          FRONTMATTER=$(sed -n '/^---$/,/^---$/p' "$DEF_FILE" | sed '1d;$d')
+
+          if [[ "$ARTIFACT_TYPE" == "skills" ]]; then
+            VERSION=$(echo "$FRONTMATTER" | grep -A1 'metadata:' | grep 'version:' | sed 's/.*version:[[:space:]]*//' | tr -d '[:space:]')
+          else
+            VERSION=$(echo "$FRONTMATTER" | grep '^version:' | sed 's/version:[[:space:]]*//' | tr -d '[:space:]')
+          fi
+
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::No version found in $DEF_FILE"
+            exit 1
+          fi
+
+          echo "Version: $VERSION"
+
+          # -------------------------------------------------------------------
+          # 3. Skip SNAPSHOT versions — no tag for in-development artifacts
+          # -------------------------------------------------------------------
+          if [[ "$VERSION" == *"-SNAPSHOT"* ]]; then
+            echo "SNAPSHOT version ($VERSION) — skipping tag creation"
+            echo "### :information_source: SNAPSHOT merged — no tag created" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$ARTIFACT\` version \`$VERSION\` is a SNAPSHOT. No tag was created." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # -------------------------------------------------------------------
+          # 4. Build tag name: <type>/<name>@<version>
+          # -------------------------------------------------------------------
+          TAG="${ARTIFACT_TYPE}/${ARTIFACT_NAME}@${VERSION}"
+
+          if git rev-parse "refs/tags/${TAG}" &>/dev/null; then
+            echo "::error::Tag ${TAG} already exists — aborting"
+            exit 1
+          fi
+
+          # -------------------------------------------------------------------
+          # 5. Determine bump type for annotation message
+          # -------------------------------------------------------------------
+          BUMP_TYPE="release"
+          if [[ "$PR_TITLE" =~ ^[a-zA-Z]+(\([a-zA-Z0-9_/-]+\))?\!:[[:space:]]* ]]; then
+            BUMP_TYPE="major"
+          elif [[ "$PR_TITLE" =~ ^feat(\([a-zA-Z0-9_/-]+\))?:[[:space:]]* ]]; then
+            BUMP_TYPE="minor"
+          elif [[ "$PR_TITLE" =~ ^fix(\([a-zA-Z0-9_/-]+\))?:[[:space:]]* ]]; then
+            BUMP_TYPE="patch"
+          fi
+
+          # -------------------------------------------------------------------
+          # 6. Create and push annotated tag
+          # -------------------------------------------------------------------
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Release ${ARTIFACT_NAME} ${VERSION} (${BUMP_TYPE})"
+          git push origin "$TAG"
+
+          echo "### :white_check_mark: Tag created: \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact** | \`$ARTIFACT\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Version** | \`$VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Tag** | \`$TAG\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump type** | $BUMP_TYPE |" >> "$GITHUB_STEP_SUMMARY"
