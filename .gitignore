@@ -1,15 +1,31 @@
 # Dependencies
 node_modules/
 
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+.python-version
+
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+*stackdump
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # MCP server build artifacts
 mcp-servers/*/dist/
@@ -20,8 +36,21 @@ mcp-servers/*/build/
 .env.*
 *.key
 *.pem
+credentials.json
 
 # Local settings
 .claude/
 CLAUDE.md
-*stackdump
+
+# Skill / script generated output
+*.pdf
+*.pptx
+*.docx
+*.xlsx
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
