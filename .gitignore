@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MCP server build artifacts
+mcp-servers/*/dist/
+mcp-servers/*/build/
+
+# Secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+
+# Local settings
+.claude/
+CLAUDE.md
+*stackdump
