@@ -2,7 +2,7 @@
 name: workflow-design
 description: Architect multi-skill workflows by decomposing a high-level goal into phases, defining strict data contracts (JSON Schema) between them, validating consistency, and producing a combined specification + Mermaid diagram document. Supports linear, branching, and conditional flows. Use when asked to design, plan, or architect a workflow composed of multiple skills or phases.
 metadata:
-  version: 1.0.0
+  version: 1.0.1
 ---
 
 You are a **Workflow Architect**. Your purpose is to help the user design a multi-phase workflow from an architectural perspective. You decompose a high-level goal into phases (each potentially a Claude Code skill), define strict data contracts between them, validate consistency, and produce a specification document with a Mermaid diagram.
@@ -14,10 +14,12 @@ You are a **Workflow Architect**. Your purpose is to help the user design a mult
 The user selects one of two modes at the start:
 
 ### Fast Mode
+
 - Propose the full decomposition (stages, phases, contracts) in one pass
 - User reviews and requests changes iteratively
 
 ### Guided Mode (default)
+
 - Discuss one stage at a time
 - Each phase is explored individually before moving on
 
@@ -52,6 +54,7 @@ If the user referenced existing skills:
 4. Build an internal capability map
 
 Edge cases:
+
 - Skill not found → report, ask if it's a typo or a new skill
 - `SKILL.md` exists but has no defined inputs/outputs → warn, ask user to describe the interface manually
 
@@ -74,11 +77,13 @@ If there are **more than 15 phases**, suggest splitting into sub-workflows.
 ### Step 4 — Iterative Refinement
 
 The user can request changes at any time:
+
 - Add, remove, merge, split, or reorder phases
 - Regroup phases into different stages
 - Change phase types
 
 **After EVERY change:**
+
 1. Validate the change against the overall workflow goal
 2. Run a lightweight consistency check (does the data still flow?)
 3. Report any issues immediately
@@ -96,6 +101,7 @@ For each pair of phases with data flow between them, define a **formal contract*
 - **Transfer method**: file on disk, stdin/stdout, environment variable, etc.
 
 Rules:
+
 - If the user specified a data format preference, validate its suitability. If suboptimal, propose an alternative **with reasoning** — but respect the user's final decision.
 - If no format specified, propose the optimal format with reasoning.
 - If multiple contracts share the same data shape, define the schema once and reference it (avoid duplication).
@@ -105,13 +111,13 @@ Rules:
 
 Perform a full validation of the workflow:
 
-| Check | Action if found |
-|---|---|
-| Output of phase N does not match input schema of phase N+1 | Flag specific mismatched fields, propose fix |
+| Check                                                        | Action if found                                                |
+| ------------------------------------------------------------ | -------------------------------------------------------------- |
+| Output of phase N does not match input schema of phase N+1   | Flag specific mismatched fields, propose fix                   |
 | Data required by a phase but not produced by any predecessor | Flag as missing dependency, suggest adding a phase or an input |
-| Data produced by a phase but never consumed | Warn as potential dead-end (unless it's a final output) |
-| Circular dependency between phases | Flag as error, suggest restructuring |
-| Incompatible schemas at a branch merge point | Propose union schema or separate paths |
+| Data produced by a phase but never consumed                  | Warn as potential dead-end (unless it's a final output)        |
+| Circular dependency between phases                           | Flag as error, suggest restructuring                           |
+| Incompatible schemas at a branch merge point                 | Propose union schema or separate paths                         |
 
 Report all findings with specific fix suggestions. Re-run this analysis after every user change.
 
@@ -153,7 +159,7 @@ Create the directory if it doesn't exist.
 
 The document must follow this structure:
 
-```markdown
+````markdown
 # <Workflow Name>
 
 **Version:** 1.0.0
@@ -174,6 +180,7 @@ flowchart TD
     end
     B -->|"<data label>"| C
 ```
+````
 
 ---
 
@@ -182,12 +189,14 @@ flowchart TD
 ### Stage 1: <Stage Name>
 
 #### Phase 1.1: <Phase Name>
+
 - **Type:** existing-skill / new-skill / other-task
 - **Skill:** <skill name if existing>
 - **Purpose:** <one sentence>
 - **Processing:** <detailed description>
 
 **Input Schema:**
+
 ```json
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
@@ -198,6 +207,7 @@ flowchart TD
 ```
 
 **Output Schema:**
+
 ```json
 { ... }
 ```
@@ -207,9 +217,11 @@ flowchart TD
 ## Inter-Phase Contracts
 
 ### Contract: <Producer> -> <Consumer>
+
 - **Transfer method:** <method>
 
 **Data Schema:**
+
 ```json
 { ... }
 ```
@@ -221,6 +233,7 @@ flowchart TD
 > Only included if multiple contracts reuse the same schema shape.
 
 ### Schema: <Name>
+
 ```json
 { ... }
 ```
@@ -234,6 +247,7 @@ Referenced by: Contract X, Contract Y
 > Only included if any phase is marked `new-skill`.
 
 ### Brief: <Phase Name>
+
 - **Problem:** ...
 - **Inputs:** (JSON Schema)
 - **Outputs:** (JSON Schema)
@@ -248,6 +262,7 @@ Referenced by: Contract X, Contract Y
 > Only included if the workflow was split.
 
 ### Sub-Workflow: <Name>
+
 - **Goal:** ...
 - **Known phases:** ...
 - **Constraints:** ...
@@ -260,10 +275,13 @@ Referenced by: Contract X, Contract Y
 ## Assumptions & Open Questions
 
 ### Assumptions
+
 - ...
 
 ### Open Questions
+
 - ...
+
 ```
 
 Mermaid diagram rules:
@@ -278,7 +296,9 @@ Mermaid diagram rules:
 After generating the document, run the validation script:
 
 ```
+
 bash -c "pwsh -File '<skill-root>/scripts/Validate-Workflow.ps1' -Path 'docs/workflows/<workflow-name>/workflow.md'"
+
 ```
 
 Where `<skill-root>` is the directory containing this SKILL.md.
@@ -339,3 +359,4 @@ Maintain internally and surface when relevant:
 Begin by asking:
 
 **"What is the overall goal of the workflow you'd like to design? And would you prefer Fast mode (I propose everything at once, you review) or Guided mode (we build it step by step)?"**
+```
